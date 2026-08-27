@@ -1,0 +1,24 @@
+# ⚠ 这个文件是**依赖说明**, 不能直接 `pip install -r requirements.txt` 装上。
+#
+# 唯一的第三方依赖 wuji-sdk **既不在公共 PyPI, 也没发布到 GitHub Releases**
+# (那边的 release 只有 C SDK 的 tar.gz)。Python 包由 SDK 源码仓库 wuji-sdk-dev
+# 用 maturin 编译产生, 跨平台/跨 Python 版本不通用:
+#
+#     maturin build --release
+#     pip install target/wheels/wuji_sdk-<版本>-cp3xx-cp3xx-<平台>.whl
+#
+# 没有构建环境就找 SDK 维护方要一个对应平台的 wheel。
+#
+# 下面这行**故意注释掉**: `wuji-sdk` 这个名字在公共 PyPI 上无人注册, 若放开成真正的
+# 依赖行, 一旦哪天被别人抢注, pip 就会从公共源拉一个来路不明的同名包(依赖混淆)。
+# 只在你们有私有源、且确认该名字归属自己时才放开。
+#
+#   wuji-sdk>=2026.8.17
+#
+# 开发与真机验证过的组合: wuji-sdk 2026.8.17 / Python 3.13 / Windows x64
+# (2026.7.21 也验证过。错误码自动解码需要 >= 2026.8.17, 老版本退回只打十六进制)
+# 最低要求: Python >= 3.10 (SDK 的 Requires-Python; 本工程代码本身 3.9 也能跑)
+#
+# 装完自检:
+#   python -c "import wuji_sdk; print(wuji_sdk.__name__)"
+#   python no_load_aging.py --dry-run      # 连得上手就会打印行程表

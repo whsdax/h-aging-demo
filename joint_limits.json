@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "version": 2,
+    "source": "structural design angle range (mechanical drawing), copied from tools/sboard_qt/app/resources/nid_ranges.json",
+    "policy": "design_spec",
+    "comment": "本表是**设计限位**, 不是某一只手的实测限位。上位机 sboard_qt 优先读固件 OD ps_final_pos_* 拿每只手的真限位, 本表只是它读不到时的兜底; 公开 Python SDK 未暴露 ps_final_pos, 所以 demo 只能用本表。要更贴合某一只手, 复制本文件改 min_rad/max_rad 后用 --limits 传入。thumb sign: palm=+, back=-。",
+    "key": "firmware NID (1..24, 5/10/15/20/25 是触觉节点无电机)"
+  },
+  "ranges": {
+    "1":  { "min_rad": -1.1868, "max_rad":  1.2915, "name": "thumb_cmc_flex" },
+    "2":  { "min_rad": -1.4835, "max_rad":  0.6981, "name": "thumb_cmc_abd" },
+    "3":  { "min_rad": -1.0472, "max_rad":  1.5708, "name": "thumb_mcp" },
+    "4":  { "min_rad": -1.0472, "max_rad":  1.5708, "name": "thumb_ip" },
+    "6":  { "min_rad": -1.0472, "max_rad":  1.5708, "name": "index_mcp_flex" },
+    "7":  { "min_rad": -0.6981, "max_rad":  0.6981, "name": "index_mcp_abd" },
+    "8":  { "min_rad": -1.0472, "max_rad":  2.0944, "name": "index_pip" },
+    "9":  { "min_rad": -1.0472, "max_rad":  1.5708, "name": "index_dip" },
+    "11": { "min_rad": -1.0472, "max_rad":  1.5708, "name": "middle_mcp_flex" },
+    "12": { "min_rad": -0.6981, "max_rad":  0.6981, "name": "middle_mcp_abd" },
+    "13": { "min_rad": -1.0472, "max_rad":  2.0944, "name": "middle_pip" },
+    "14": { "min_rad": -1.0472, "max_rad":  1.5708, "name": "middle_dip" },
+    "16": { "min_rad": -1.0472, "max_rad":  1.5708, "name": "ring_mcp_flex" },
+    "17": { "min_rad": -0.6981, "max_rad":  0.6981, "name": "ring_mcp_abd" },
+    "18": { "min_rad": -1.0472, "max_rad":  2.0944, "name": "ring_pip" },
+    "19": { "min_rad": -1.0472, "max_rad":  1.5708, "name": "ring_dip" },
+    "21": { "min_rad": -1.0472, "max_rad":  1.5708, "name": "pinky_mcp_flex" },
+    "22": { "min_rad": -0.6981, "max_rad":  0.6981, "name": "pinky_mcp_abd" },
+    "23": { "min_rad": -1.0472, "max_rad":  2.0944, "name": "pinky_pip" },
+    "24": { "min_rad": -1.0472, "max_rad":  1.5708, "name": "pinky_dip" }
+  }
+}

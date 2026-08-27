@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# 现场改出来的限位表 / 日志, 各工位自己留
+joint_limits.local.json
+*.log
+
+# --export-limits 导出的**逐手**实测限位表 (文件名带 SN, 换手就没意义)
+# 随时可以重新跑一轮生成, 不进仓库
+limits_*.json
+pass*_*.json
