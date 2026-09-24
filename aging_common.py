@@ -218,6 +218,37 @@ class JointLimits:
         return (r[0] + r[1]) * 0.5, max(0.0, (r[1] - r[0]) * 0.5 - margin_rad)
 
 
+class FingerRemappedLimits(JointLimits):
+    """把**一个参考指位**的限位复制到全部 5 个槽位。
+
+    为什么需要: 指位身份只由「插在脊髓板哪个口」决定 —— 关节板 flash 里只有
+    `ImmutableMeta.device_addr`(总线内第几个电机, 1..5), 不上报自己是哪根手指。
+    所以 5 个槽位挂 5 个**同型**手指模组时(专跑拇指 / 专跑四指的治具), 按 NID
+    查表会拿到 thumb/index/middle/ring/pinky 五套**不同**限位, 其中只有一套对。
+    拇指与四指的差别不小(J1 上限 74° vs 90°, J2 下限 -85° vs -40°), 按错的表
+    钳位轻则行程不足, 重则每圈顶死限位。
+
+    本类只改「k → 限位」这一层查表, **不动** flat 下标, 也不动 `joint_label()`:
+    日志里仍然打 `index_J1` 这种**槽位名**, 因为操作员是按槽位号去拔插模组的,
+    不是按指名。
+
+    注意 `is_measured()` 也跟着取参考槽的来源标记 —— 所以 `--export-limits`
+    导出的表拿去给**另一种**指型的治具用会是错的; 这两个专用脚本默认就只读设计表。
+    """
+
+    def __init__(self, base: JointLimits, ref_finger: int):
+        self.path = base.path
+        self.serial_number = base.serial_number
+        self.ref_finger = ref_finger
+        self._rng: Dict[int, Tuple[float, float, str]] = {}
+        self._src: Dict[int, str] = {}
+        for k in JOINTS:
+            ref_k = ref_finger * 4 + slot_of(k)
+            if ref_k in base._rng:
+                self._rng[k] = base._rng[ref_k]
+                self._src[k] = base._src.get(ref_k, "")
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # 老化档案 —— 每个 demo 脚本产出一个 Profile, 骨架照着跑
 # ──────────────────────────────────────────────────────────────────────────
@@ -225,7 +256,19 @@ class JointLimits:
 # 轨迹函数: (t, env) -> (positions[20], velocities[20]), 单位 rad / rad·s⁻¹
 #   t   从运动段开始起算的秒数, **永远累加不 wrap**(取模会让正弦相位跳变);
 #   env 振幅包络 0..1, 骨架用它做起步渐入和停止收摆 —— **只乘振幅, 别乘中心位置**。
+# 也可以返回三元组 (pos, vel, eff), 自己接管前馈力矩通道 —— 见 `_emit()`。
 MotionFn = Callable[[float, float], Tuple[List[float], List[float]]]
+
+# 编排函数: (runner, profile) -> None。
+#
+# 给**不是「一个无限循环的波形」**的工序用 —— 典型是位控性能QC: 逐指使能、测一段、
+# 算一个数、再换下一指。这种流程装不进 `motion(t, env)`: 它要在阶段之间阻塞着调 SDK
+# (切使能范围), 还要拿上一段的测量结果决定下一段。
+#
+# 非 None 时 `HandRunner.run()` 跑完 `_configure()` 就把控制权交给它, 不走默认的
+# 「预置使能 → 回零 → 无限运动循环 → 停机序列」四段链; 使能范围由它自己用
+# `runner.scope()` / `runner.unscope()` 逐批切。`_shutdown()` 照常兜底(安全纪律 #4)。
+SequenceFn = Callable[["HandRunner", "Profile"], None]
 
 
 @dataclass
@@ -248,6 +291,11 @@ class Profile:
     release_floor_a: float = 0.0
     period_s: float = 10.0           # 动作周期(仅 --dry-run 采样行程用)
     notes: List[str] = field(default_factory=list)   # 启动时打印给操作员的提示
+    #: 非 None → 由它接管整个运动流程, 不走默认四段链。见 `SequenceFn`。
+    sequence: Optional[SequenceFn] = None
+    #: 收尾时整手 disable, 而不是只断 `enabled` 那几个。
+    #: `sequence` 会逐批改 `enabled`, 收尾时它只剩最后一批 —— 前面几批就漏掉了。
+    disable_all_on_exit: bool = False
 
     def mask(self) -> List[int]:
         return [int(e) for e in self.enabled]
@@ -336,12 +384,20 @@ class HandRunner(threading.Thread):
                     self.ok = True
                     return
                 self._configure(prof)
-                self._preseed_and_enable(prof)
-                self._zero_return(prof)
+                if prof.sequence is None:
+                    self._preseed_and_enable(prof)
+                    self._zero_return(prof)
             finally:
                 _STARTUP_LOCK.release()
-            t_stop = self._motion_loop(prof)
-            self._stop(prof, t_stop)
+            if prof.sequence is not None:
+                # 使能/回零/测量全在编排函数里。它自己逐批 scope(), 所以放在起跑锁
+                # **外面** —— 一拖多时几只手并行测, 不然 5 指 × 几十秒要串成几倍。
+                # `_running` 先置起来: 之后出错只停本手, 别把整场拖下水(同下面的注释)。
+                self._running = True
+                prof.sequence(self, prof)
+            else:
+                t_stop = self._motion_loop(prof)
+                self._stop(prof, t_stop)
             self.ok = True
         except BaseException as exc:                      # noqa: BLE001
             self.error = "%s: %s" % (type(exc).__name__, exc)
@@ -361,11 +417,18 @@ class HandRunner(threading.Thread):
     # ── 连接与反馈 ──────────────────────────────────────────────────────
     def _connect(self) -> None:
         self.log("连接 %s ..." % self.address)
+        # enable_bridge 是给**多个进程共享同一只手**用的: 开了它, 本进程会起一个
+        # DeviceBridge 占住设备那条唯一会话, 别的进程(watch.py)再连就挂到这个桥上,
+        # 而不是去抢设备 —— 设备的并发会话数只有个位数, 第二个进程直连会被
+        # close reason 3 (MAX_SESSIONS) 拒掉, 见 connect_hint()。
+        #
+        # 默认**关**: 关掉可以少一个 bridge 看门狗误判断链的失效面, 而长跑老化最怕的
+        # 就是没验过的组件在第 N 小时掉链子。要在老化期间用 watch.py 看数据才加
+        # --bridge, 并且先在台架上长跑验一轮。
+        bridge = bool(getattr(self.args, "bridge", False))
         self.hand = SdkManager.instance().connect(
             address=self.address, device_name=self.alias,
-            # enable_bridge 是给**多个进程共享同一只手**用的; 本 demo 每个进程各连
-            # 各的手, 用不上。关掉可以少一个 bridge 看门狗误判断链的失效面。
-            options=ConnectOptions(timeout_ms=3000, retry_count=3, enable_bridge=False))
+            options=ConnectOptions(timeout_ms=3000, retry_count=3, enable_bridge=bridge))
         self.serial_number = self.hand.serial_number
         try:
             self.handedness = self.hand.handedness().get()
@@ -687,19 +750,61 @@ class HandRunner(threading.Thread):
             self._send(self._hold, _ZEROS, _ZEROS)
             time.sleep(FRAME_INTERVAL_S)
 
+    # ── 逐批使能 (给 SequenceFn 用) ─────────────────────────────────────
+    def scope(self, prof: Profile, enabled: Sequence[bool], label: str = "") -> None:
+        """把使能范围切到一组新的 slot: 断开旧的 → 预置保位 → 使能新的。
+
+        **为什么要分批而不是整手一次使能**(位控QC 逐指跑就是为了这个, 与上位机
+        `PosPerfQcWorker` 同一个理由):
+          - 20 轴齐动的母线电流会把扭矩顶到限流, 限流下测出来的跟踪延迟和静差全不可信;
+          - 一次 enable 20 个关节偶发会话卡死。
+
+        每次切都重走安全纪律 #1 和 #3: 先用 target=actual 播满预置帧再通电, 未选
+        slot 填**切换瞬间**的实际角当保位值(不是 0)。
+        """
+        if any(prof.enabled):
+            self._try(lambda: self.hand.disable(joints=prof.mask()))
+        prof.enabled = list(enabled)
+        self._hold = list(self.actual)
+        self._hold_frames(PRESEED_FRAMES)
+        idxs = prof.idxs()
+        self.log("使能%s: %s" % (label or " %d 个关节" % len(idxs),
+                                 ", ".join(joint_label(k) for k in idxs)))
+        self.hand.enable(joints=prof.mask())
+        self._hold_frames(POST_ENABLE_FRAMES)
+
+    def unscope(self, prof: Profile) -> None:
+        """断开当前这一批。断完 `enabled` 全 False —— 之后 `_emit()` 对 20 个 slot
+        一律发保位值, 即使编排函数还在下发也不会动手。"""
+        if any(prof.enabled):
+            self._try(lambda: self.hand.disable(joints=prof.mask()))
+        prof.enabled = [False] * TOTAL_JOINTS
+
     # ── 下发 ────────────────────────────────────────────────────────────
     def _send(self, pos, vel, eff) -> None:
         self._pub.send([JointCommand(float(pos[k]), float(vel[k]), float(eff[k]))
                         for k in JOINTS])
 
-    def _emit(self, prof: Profile, pos: Sequence[float], vel: Sequence[float]) -> None:
-        """未选 slot 换成保位值(安全纪律 #3) + 速度前馈, 然后下发。"""
+    def _emit(self, prof: Profile, pos: Sequence[float], vel: Sequence[float],
+              eff: Optional[Sequence[float]] = None) -> None:
+        """未选 slot 换成保位值(安全纪律 #3) + 速度前馈, 然后下发。
+
+        `eff` 非 None → 力矩通道**由轨迹自己给**, 不再套 `KD_FF * vel` 的速度前馈。
+        位控QC 的软件积分走这条(固件没有 ki, 静差只能靠上位机侧积分补), 而且它测
+        跟踪延迟那一趟必须是**纯位置通道**: 带上速度前馈等于给了固件超前量, 测出来
+        的延迟会偏小。未选 slot 的力矩一律清零, 免得给保位中的关节额外加力。
+        """
         self._last_cmd = list(pos)
         p, v = list(pos), list(vel)
+        e = list(eff) if eff is not None else None
         for k in JOINTS:
             if not prof.enabled[k]:
                 p[k], v[k] = self._hold[k], 0.0
-        if prof.feedforward:
+                if e is not None:
+                    e[k] = 0.0
+        if e is not None:
+            self._send(p, v, e)
+        elif prof.feedforward:
             self._send(p, v, [KD_FF * v[k] for k in JOINTS])
         else:
             self._send(p, _ZEROS, _ZEROS)   # 位置通道(与上位机滑条一致)
@@ -733,6 +838,35 @@ class HandRunner(threading.Thread):
                 next_t = time.perf_counter()   # 被调度拖太远, 重新对齐
                 self._late += 1
         return time.perf_counter() - t0
+
+    # ── 阶段原语 (给 SequenceFn 用) ─────────────────────────────────────
+    def run_phase(self, prof: Profile, traj, secs: float, label: str = "") -> bool:
+        """以 200Hz 跑一段**固定时长**的轨迹, 期间随时响应停机请求。
+
+        `traj(t)` 返回 (pos, vel) 或 (pos, vel, eff) —— 见 `MotionFn`。t 从本段开头
+        起算(每段都从 0 开始), 所以跨段累积的状态要自己存在闭包里。
+
+        返回 True = 跑完; False = 中途收到停机请求(Ctrl+C / --duration 到时),
+        编排函数**应当立刻收尾**, 别再往下测。
+        """
+        self._run(prof, traj, secs, label, until=lambda _t: self.stop_event.is_set())
+        return not self.stop_event.is_set()
+
+    def ramp_phase(self, prof: Profile, dst: Sequence[float], secs: float,
+                   label: str = "") -> bool:
+        """从**当前实际角**余弦斜坡到 dst(两端速度为 0)。返回值同 `run_phase()`。"""
+        return self.run_phase(prof, self._ramp(list(self.actual), list(dst), secs),
+                              secs, label)
+
+    def limit_flags(self, nid: int) -> int:
+        """该关节**最新一帧**的限幅标志 (LIM_POS/LIM_VEL/LIM_CUR 按位或)。
+
+        给 SequenceFn 判「这次测量还算不算数」用: 命令角超出这只手的真限位时固件会
+        把它夹住, 夹住期间量到的静差是「命令角 - 限位角」, 不是伺服误差 —— 拿它
+        判合格就是误判。注意取的是**最新一帧**, 要覆盖一整段就每拍 OR 一次。
+        """
+        d = self._diag
+        return 0 if not d else int(d[5].get(nid, 0))
 
     # ── 轨迹片段 ────────────────────────────────────────────────────────
     @staticmethod
@@ -871,10 +1005,12 @@ class HandRunner(threading.Thread):
             self._close()
             return
         try:
-            if prof is not None:
+            if prof is not None and not prof.disable_all_on_exit:
                 self.hand.disable(joints=prof.mask())
             else:
-                self.hand.disable()                       # 还没建出档案 → 整手断
+                # 还没建出档案, 或档案自己要求整手断(逐批使能的流程 —— 此刻 mask 里
+                # 只剩最后一批, 按它断会漏掉前面几批) → 整手断。
+                self.hand.disable()
             self.log("已断使能")
         except Exception as exc:                          # noqa: BLE001
             self.log("disable 失败 (%s), 兜底整手 disable" % exc)
@@ -1016,6 +1152,11 @@ def build_argparser(description: str, examples: str = "") -> argparse.ArgumentPa
                          "只缩摆幅, 不动中心位置")
     ap.add_argument("--dry-run", action="store_true",
                     help="只连接 + 打印本次要跑的行程, 不使能不运动")
+    ap.add_argument("--bridge", action="store_true",
+                    help="开多客户端桥 —— **想在老化跑着的时候用 watch.py 看实时数据就必须加"
+                         "这个**。不加的话本进程独占设备那条唯一会话, watch.py 连不上"
+                         "(报 MAX_SESSIONS)。代价是多一个没在长跑里验过的组件, "
+                         "所以默认关; 顺序是先起老化(桥主)再起 watch.py, 先退 watch.py")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="打印 SDK 内部日志 (连不上 / 掉线时用来看细节)")
     return ap

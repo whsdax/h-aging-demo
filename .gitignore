@@ -9,3 +9,6 @@ joint_limits.local.json
 # 随时可以重新跑一轮生成, 不进仓库
 limits_*.json
 pass*_*.json
+
+# 加判定章节前的 README 原版, 本地对比用, 不交付
+README.orig.md
